@@ -45,7 +45,7 @@ typedef struct {
 typedef struct {
     u32 Magic;
     u8 _0x4[0xC];
-    u64 TitleId;
+    u64 ProgramId;
     u64 _0x18;
     u32 FahOffset;
     u32 FahSize;
@@ -63,8 +63,8 @@ typedef struct {
     u32 Size;
     u32 _0x208;
     u32 Flags;
-    u64 TitleIdRangeMin;
-    u64 TitleIdRangeMax;
+    u64 ProgramIdRangeMin;
+    u64 ProgramIdRangeMax;
     u32 FacOffset;
     u32 FacSize;
     u32 SacOffset;
@@ -76,7 +76,7 @@ typedef struct {
 
 typedef struct {
     u32 Magic;
-    u32 _0x4;
+    u32 SignatureKeyGeneration;
     u32 _0x8;
     u8 MmuFlags;
     u8 _0xD;
@@ -84,7 +84,7 @@ typedef struct {
     u8 DefaultCpuId;
     u32 _0x10;
     u32 SystemResourceSize;
-    u32 ProcessCategory;
+    u32 Version;
     u32 MainThreadStackSize;
     char Name[0x10];
     char ProductCode[0x10];
@@ -345,10 +345,11 @@ int CreateNpdm(const char *json, void **dst, u32 *dst_size) {
 
     cJSON_GetU32(npdm_json, "system_resource_size", &header.SystemResourceSize); // optional
 
-    if (!cJSON_GetU8(npdm_json, "process_category", (u8 *)&header.ProcessCategory)) {
-        status = 0;
-        goto NPDM_BUILD_END;
+    /* Get version (deprecated name "process_category"). */
+    if (!cJSON_GetU32(npdm_json, "version", &header.Version) && !cJSON_GetU32(npdm_json, "process_category", &header.Version)) { // optional
+        header.Version = 0;
     }
+
     if (!cJSON_GetU8(npdm_json, "address_space_type", (u8 *)&header.MmuFlags)) {
         status = 0;
         goto NPDM_BUILD_END;
@@ -362,9 +363,21 @@ int CreateNpdm(const char *json, void **dst, u32 *dst_size) {
     }
     header.MmuFlags |= is_64_bit;
 
+    int optimize_memory_allocation; // optional
+    if (cJSON_GetBoolean(npdm_json, "optimize_memory_allocation", &optimize_memory_allocation)) {
+        header.MmuFlags |= ((optimize_memory_allocation & 1) << 4);
+    }
+
     int disable_device_address_space_merge; // optional
     if (cJSON_GetBoolean(npdm_json, "disable_device_address_space_merge", &disable_device_address_space_merge)) {
         header.MmuFlags |= ((disable_device_address_space_merge & 1) << 5);
+    }
+
+    u8 signature_key_generation; // optional
+    if (cJSON_GetU8(npdm_json, "signature_key_generation", &signature_key_generation)) {
+        header.SignatureKeyGeneration = signature_key_generation;
+    } else {
+        header.SignatureKeyGeneration = 0;
     }
 
     /* ACID. */
@@ -384,19 +397,19 @@ int CreateNpdm(const char *json, void **dst, u32 *dst_size) {
     }
     acid->Flags |= (pool_partition & 3) << 2;
 
-    if (!cJSON_GetU64(npdm_json, "title_id_range_min", &acid->TitleIdRangeMin)) {
+    if (!cJSON_GetU64(npdm_json, "program_id_range_min", &acid->ProgramIdRangeMin) && !cJSON_GetU64(npdm_json, "title_id_range_min", &acid->ProgramIdRangeMin)) {
         status = 0;
         goto NPDM_BUILD_END;
     }
-    if (!cJSON_GetU64(npdm_json, "title_id_range_max", &acid->TitleIdRangeMax)) {
+    if (!cJSON_GetU64(npdm_json, "program_id_range_max", &acid->ProgramIdRangeMax) && !cJSON_GetU64(npdm_json, "title_id_range_max", &acid->ProgramIdRangeMax)) {
         status = 0;
         goto NPDM_BUILD_END;
     }
 
     /* ACI0. */
     aci0->Magic = MAGIC_ACI0; /* "ACI0" */
-    /* Parse title_id. */
-    if (!cJSON_GetU64(npdm_json, "title_id", &aci0->TitleId)) {
+    /* Parse program_id (or deprecated title_id). */
+    if (!cJSON_GetU64(npdm_json, "program_id", &aci0->ProgramId) && !cJSON_GetU64(npdm_json, "title_id", &aci0->ProgramId)) {
         status = 0;
         goto NPDM_BUILD_END;
     }
@@ -458,18 +471,33 @@ int CreateNpdm(const char *json, void **dst, u32 *dst_size) {
     sdois = cJSON_GetObjectItemCaseSensitive(fsaccess, "save_data_owner_ids");
     if (cJSON_IsArray(sdois)) {
         u32 *count = (u32 *)((u8 *)fah + fah->SdoiOffset);
-        u64 *id = (u64 *)((u8 *)count + sizeof(u32));
         cJSON_ArrayForEach(sdoi, sdois) {
-            if (!cJSON_GetU64FromObjectValue(sdoi, id)) {
+            if (!cJSON_IsObject(sdoi)) {
                 status = 0;
                 goto NPDM_BUILD_END;
             }
-            ++id;
             ++(*count);
         }
 
+        u8 *accessibility = (u8 *)count + sizeof(u32);
+        u64 *id = (u64 *)(accessibility + (((*count) + 3ULL) & ~3ULL));
+
+        cJSON_ArrayForEach(sdoi, sdois) {
+            if (!cJSON_GetU8(sdoi, "accessibility", accessibility)) {
+                status = 0;
+                goto NPDM_BUILD_END;
+            }
+            if (!cJSON_GetU64(sdoi, "id", id)) {
+                status = 0;
+                goto NPDM_BUILD_END;
+            }
+
+            ++accessibility;
+            ++id;
+        }
+
         if (*count > 0) {
-            fah->SdoiSize = sizeof(u32) + sizeof(u64) * (*count);
+            fah->SdoiSize = sizeof(u32) + sizeof(u8) * ((((*count) + 3ULL) & ~3ULL)) + sizeof(u64) * (*count);
         }
     }
 
@@ -618,13 +646,17 @@ int CreateNpdm(const char *json, void **dst, u32 *dst_size) {
                 status = 0;
                 goto NPDM_BUILD_END;
             }
+
+            u8 real_highest_prio = (lowest_prio < highest_prio) ? lowest_prio : highest_prio;
+            u8 real_lowest_prio  = (lowest_prio > highest_prio) ? lowest_prio : highest_prio;
+
             desc = highest_cpu;
             desc <<= 8;
             desc |= lowest_cpu;
             desc <<= 6;
-            desc |= (lowest_prio & 0x3F);
+            desc |= (real_highest_prio & 0x3F);
             desc <<= 6;
-            desc |= (highest_prio & 0x3F);
+            desc |= (real_lowest_prio & 0x3F);
             caps[cur_cap++] = (u32)((desc << 4) | (0x0007));
         } else if (!strcmp(type_str, "syscalls")) {
             if (!cJSON_IsObject(value)) {
@@ -633,7 +665,7 @@ int CreateNpdm(const char *json, void **dst, u32 *dst_size) {
                 goto NPDM_BUILD_END;
             }
             u32 num_descriptors;
-            u32 descriptors[6] = {0}; /* alignup(0x80/0x18); */
+            u32 descriptors[8] = {0}; /* alignup(0xC0/0x18); */
             char field_name[8] = {0};
             const cJSON *cur_syscall = NULL;
             u64 syscall_value = 0;
@@ -646,14 +678,14 @@ int CreateNpdm(const char *json, void **dst, u32 *dst_size) {
                     goto NPDM_BUILD_END;
                 }
 
-                if (syscall_value >= 0x80) {
-                    fprintf(stderr, "Error: All syscall entries must be numbers in [0, 0x7F]\n");
+                if (syscall_value >= 0xC0) {
+                    fprintf(stderr, "Error: All syscall entries must be numbers in [0, 0xBF]\n");
                     status = 0;
                     goto NPDM_BUILD_END;
                 }
                 descriptors[syscall_value / 0x18] |= (1UL << (syscall_value % 0x18));
             }
-            for (unsigned int i = 0; i < 6; i++) {
+            for (unsigned int i = 0; i < 8; i++) {
                 if (descriptors[i]) {
                     desc = descriptors[i] | (i << 24);
                     caps[cur_cap++] = (u32)((desc << 5) | (0x000F));
@@ -680,7 +712,8 @@ int CreateNpdm(const char *json, void **dst, u32 *dst_size) {
             desc |= is_ro << 24;
             caps[cur_cap++] = (u32)((desc << 7) | (0x003F));
 
-            desc = (u32)((map_size >> 12) & 0x00FFFFFFULL);
+            desc = (u32)((map_size >> 12) & 0x000FFFFFULL);
+            desc |= (u32)(((map_address >> 36) & 0xFULL) << 20);
             is_io ^= 1;
             desc |= is_io << 24;
             caps[cur_cap++] = (u32)((desc << 7) | (0x003F));
